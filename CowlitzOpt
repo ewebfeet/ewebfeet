@@ -1,0 +1,1439 @@
+import textwrap
+import pandas as pd
+import pyodbc
+import numpy as np
+import sqlite3
+import datetime as dt
+import requests
+from io import StringIO
+import re
+from pandas.tseries.holiday import Holiday, USMemorialDay, USLaborDay, AbstractHolidayCalendar, nearest_workday, USThanksgivingDay
+import datetime as dt
+from dateutil.relativedelta import TU, FR   #Friday
+import os
+
+from . import climate_adjust
+
+#######################
+# Celsius to fahrenheit
+#######################
+
+def celsius_to_fahrenheit(celsius_series):
+    return celsius_series * 9/5 + 32
+
+
+###########################################################
+# The following functions query the PMDW database
+###########################################################
+
+def print_query_string(query_string):
+    print(textwrap.fill(query_string, width=80))
+
+def make_and_or_string(col, values):
+    conditions = []
+    for val in values:
+        condition = f"{col} = '{val}'"
+        conditions.append(condition)
+
+    or_conditions = " OR ".join(conditions)
+    final_condition = f"AND ({or_conditions})"
+    return final_condition
+
+def make_and_or_and_string(col0, col1, vals0, vals1):
+    conditions = []
+    for v0, v1 in zip(vals0, vals1):
+        condition = f"({col0} = '{v0}' AND {col1} = '{v1}')"
+        conditions.append(condition)
+
+    or_conditions = " OR ".join(conditions)
+    final_condition = f"AND ({or_conditions})"
+    return final_condition
+
+def make_left_join_daterange_params_locs_query_string(left_table, right_tables, left_right_join_cols,
+                            right_keep_cols_rename, datetime_field , start , end ,  left_cols, locs, params):
+    # Make query string
+    right_cols = [f'{rht}.{rhc} AS {rhcnew}'
+                for rht, (rhc, rhcnew) 
+                in zip(right_tables, right_keep_cols_rename)]
+    joins = [f"LEFT JOIN {rht} ON {left_table}.{lhc} = {rht}.{rhc}" 
+            for rht, (lhc, rhc) 
+            in zip(right_tables, left_right_join_cols)]
+    cols = left_cols+right_cols
+    q0 = f"SELECT {', '.join(cols)} FROM {left_table} {' '.join(joins)} "
+    q1 = f"WHERE {datetime_field} >= {start} AND {datetime_field} < {end} "
+    q2 = make_and_or_and_string('DimTacPrjLocation.Location', 
+                                'DimTacPrjDataType.TypeName', 
+                                locs, params)
+    query = q0 + q1 + q2
+    return query
+
+def make_empirical_flow_query_string(start, end, locs, params):
+    # remove "-" if necessary
+    start = start.replace("-", "")
+    end = end.replace("-", "")
+    return make_left_join_daterange_params_locs_query_string(
+                        left_table = 'Fact_TacomaProjects_Flow_Elevation_Daily',
+                        right_tables = ['DimTacPrjDataType',
+                                        'DimSource',
+                                        'DimTacPrjLocation'],
+                        left_right_join_cols = [('DataTypeID', 'ID'), 
+                                                ('SourceID', 'ID'),
+                                                ('TacPrjLocationID',  'ID')],
+                        right_keep_cols_rename = [('TypeName', 'Param'),
+                                                ('SourceCode',  'Source'),
+                                                ('Location', 'Loc')],
+                        datetime_field = 'RecordDateID',
+                        start = start,
+                        end = end,
+                        left_cols = ['RecordDateID', 'Value'], 
+                        locs = locs,
+                        params = params)
+
+def make_left_join_query_string(left_table, right_tables, left_right_join_cols,
+                            right_keep_cols_rename,  left_cols):
+    '''
+    Constructs a SQL left join query string based on the given parameters.
+
+    This function generates a SQL query string that performs a left join on the 
+    `left_table` with multiple `right_tables`. The join conditions and columns to be
+    selected from each table are specified by the user.
+
+    Parameters:
+    - left_table (str): The name of the left table to join.
+    - right_tables (list of str): A list of right table names to join with the left table.
+    - left_right_join_cols (list of tuples): A list of tuples where each tuple contains
+      a pair of column names (left_table_column, right_table_column) used for joining.
+    - right_keep_cols_rename (list of tuples): A list of tuples where each tuple contains
+      a pair of column names (original_column_name, new_alias_name) indicating which columns 
+      to select from the right tables and what to rename them as.
+    - left_cols (list of str): A list of column names to select from the left table.
+
+    Returns:
+    - query (str): The resulting SQL left join query string.
+
+    Example Usage:
+    query_string = make_left_join_query_string(
+                    left_table = 'Fact_Load_HourlyMWh',
+                    right_tables = ['DimLoadType', 'DimLoadAndPeak'],
+                    left_right_join_cols = [('LoadTypeID', 'ID'), ('LoadAndPeakID', 'ID')],
+                    right_keep_cols_rename = [('LoadTypeName','LoadTypeName'), ('IsHLH','IsHLH')],
+                    left_cols = ['UTCPeriodEndDateTime', 'MWh'])
+    '''
+    # Make query string
+    right_cols = [f'{rht}.{rhc} AS {rhcnew}'
+                for rht, (rhc, rhcnew) 
+                in zip(right_tables, right_keep_cols_rename)]
+    joins = [f"LEFT JOIN {rht} ON {left_table}.{lhc} = {rht}.{rhc}" 
+            for rht, (lhc, rhc) 
+            in zip(right_tables, left_right_join_cols)]
+    cols = left_cols+right_cols
+    query = f"SELECT {', '.join(cols)} FROM {left_table} {' '.join(joins)} "
+
+    return query
+
+def wrangle_datetime_utc_to_pac(df, utc_period_end_col = 'UTCPeriodEndDateTime'):
+    '''This messes up daylight savings (I think)'''
+    # wrangle datetime
+    df = df.sort_values(utc_period_end_col)
+    df = df.set_index(utc_period_end_col)
+    df.index = df.index.tz_localize('UTC', ambiguous='NaT',  nonexistent='shift_forward').tz_convert('US/Pacific')
+    df['dt'] = df.index.floor('H', ambiguous='NaT')
+    df = df.set_index('dt')
+    df['day_of_week'] = df.index.day_of_week
+    df['date'] = df.index.date
+    return df
+
+def wrangle_datetime_utc_to_pac2(df, utc_period_end_col = 'UTCPeriodEndDateTime'):
+    # wrangle datetime
+    df = df.sort_values(utc_period_end_col)
+    df = df.set_index(utc_period_end_col)
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df.index = pd.to_datetime(df.index)
+    df.index = df.index.floor('H')
+    df.index = df.index.tz_localize('UTC').tz_convert('US/Pacific')
+    df.index = df.index.rename('dt')
+    df['day_of_week'] = df.index.day_of_week
+    df['date'] = df.index.date
+    return df
+
+def query_pmdb(query_string):
+    server = '172.19.254.17'
+    database = 'pmdw'
+    username = 'PM_ReadOnly'
+    password = 'PMR0!'
+
+    # Define the connection string
+    connection_string = f"DRIVER={{SQL Server}};SERVER={server};DATABASE={database};UID={username};PWD={password}"
+    # Connect to the database
+    conn = pyodbc.connect(connection_string)
+    results = pd.read_sql(query_string, conn)
+    conn.close()
+    # Return
+    return results
+
+def inflow_database_query(start, end, 
+                          locs = ['Mossyrock', 'Mayfield', 'Alder', 'Cushman1', 'Wynoochee'],
+                          params = [ 'Inflow', 'Sideflow', 'Inflow', 'Inflow', 'Inflow'], 
+                          rename_cols0 = {'Alder': 'Nisqually', 'Cushman1':'Cushman', 
+                                'Mayfield': 'Cowlitz', 'Mossyrock': 'Cowlitz'}, 
+                          rename_cols1 = {'Inflow':'inflow_cfs', 'Sideflow':'sideflow_cfs'},
+                          estimate_wynoochee=True, 
+                          clip_neg=True): 
+                        #   climate_adjust_flag=False,
+                        #   climate_adjust_reference_year=None, 
+                        #   system_model=None):
+    '''inflow_database_query gets a start date and end date, 
+    and some lists of strings to help with control of the query, and 
+    returns a DataFrame with a column multiindex with the location at level0 and 
+    `inflow_cfs` and `sideflow_cfs` columns below each location in level1  
+    '''
+    
+    # get the query string
+    query_string = make_empirical_flow_query_string(start, end, locs, params)
+    # query the database
+    df = query_pmdb(query_string)
+    # datetime wrangle
+    df['dt_weather'] = pd.to_datetime(df.RecordDateID, 
+                    format="%Y%m%d").dt.tz_localize('US/Pacific')
+    # pivot table
+    piv =  df.pivot_table(index = 'dt_weather', columns = ['Loc','Param'], values  = 'Value')
+
+    # wrangle
+    piv.rename(columns=rename_cols0, level=0, inplace=True)
+    piv.rename(columns=rename_cols1, level=1, inplace=True)
+
+    # sideflows are 0 for Nisqually and Cushman adn Wynoochee
+    sf0_projects = ['Nisqually', 'Cushman', 'Wynoochee']
+    sf0_uppers = ['Alder', 'Cushman1', 'Wynoochee']
+    if 'Sideflow' in params:
+        for project, loc in zip(sf0_projects, sf0_uppers):
+            if loc in locs:
+                piv[(project, 'sideflow_cfs')] = 0
+
+    # return piv
+    piv =  piv.sort_index(axis=1)
+    
+    # Split the inflows into a dictionary of separate DFs resource name (location)
+    inflow_dfs = {}
+    hydro_resource_names = piv.columns.get_level_values(level=0).drop_duplicates()
+    for resource_name in hydro_resource_names:
+        inflow_dfs[resource_name] = piv[resource_name]
+        inflow_dfs[resource_name].columns.name = None
+
+    # Wynoochee has limited data.  Based on analysis elsewhere, a simple multiplier on Cushman is a reasonable estimate 
+    # and better at extrapolation than quantile scaling.
+    if 'Wynoochee' in locs:
+        if estimate_wynoochee:
+            cush_wyn_flow_converstion_factor = 0.6366824153681291
+            if 'Wynoochee' in inflow_dfs:
+                inflow_dfs['Wynoochee'] = inflow_dfs['Wynoochee'].combine_first(inflow_dfs['Cushman'] * cush_wyn_flow_converstion_factor )
+            else:
+                inflow_dfs['Wynoochee'] = inflow_dfs['Cushman'] * cush_wyn_flow_converstion_factor
+    
+    # clip the negatives [TODO: process inflows to balance mass
+    # rather than clip]
+    if clip_neg:
+        for key, df in inflow_dfs.items():
+            inflow_dfs[key] = df.clip(lower=0)
+    
+    return inflow_dfs
+
+def inflow_historical_data_load():
+    read_folder = r"\\fs109\PUBLIC\PowerManagement\IRP Working\ModelDataInput\historical_inflows"
+    return  read_parquet_from_folder(read_folder)
+
+def climate_adjust_inflows(inflow_dfs, system_model, climate_adjust_reference_year, clip_neg=True):
+    for key, df in inflow_dfs.items():
+        if climate_adjust_reference_year:
+            years_diff = (climate_adjust_reference_year - df.index.year).values
+        else:
+            # years_diff  calculated based on 
+            # the difference of dt and dt_weather
+            years_diff = system_model.dt_df.index.year - system_model.dt_df.dt_weather.dt.year
+            years_diff.index = system_model.dt_df.dt_weather
+            years_diff.name = 'years_diff'
+            idx = df.index.tz_localize(None)
+            years_diff_merged = pd.DataFrame(index=idx).merge(
+                years_diff.groupby(years_diff.index).mean(), 
+                how='left', left_index=True, right_index=True).bfill()
+            years_diff=years_diff_merged.years_diff.values
+        
+        # modify inplace
+        climate_adjust.adjust_inflows(inflow_df=df, 
+                                        project_name=key, 
+                                        years_diff=years_diff)
+    if clip_neg:
+        for key, df in inflow_dfs.items():
+            inflow_dfs[key] = df.clip(lower=0)
+    
+    return inflow_dfs
+
+def climate_adjust_temp(df, climate_adjust_reference_year):
+    # if there is a reference year, then the adjustment is variable
+    if climate_adjust_reference_year:
+        years_diff = (climate_adjust_reference_year - df.dt_weather.dt.year).values
+    # if there is no reference year, then adjustment operates between the 
+    # weather time and the model time
+    else:
+        years_diff = (df.index.year - df.dt_weather.dt.year).values
+    
+    cols = ['temp_daily_max_F', 'temp_daily_min_F']
+    df[cols] = climate_adjust.adjust_temp(day_of_year=df.day_of_year, 
+                                            years_diff=years_diff, 
+                                            data_cols=df[cols])
+    return df
+
+
+def get_proj_inflows(dt_df, project, clip_neg=True):
+    '''This is much like inflow_database_query but for only one project.
+    '''
+    start = dt_df.at[dt_df.index[0], 'dt_weather'].strftime('%Y-%m-%d')
+    end = dt_df.at[dt_df.index[-1], 'dt_weather'].strftime('%Y-%m-%d') 
+    if project == 'Cowlitz':
+        locs = ['Mossyrock', 'Mayfield']
+        params = ['Inflow', 'Sideflow']
+    elif project == 'Nisqually':
+        locs = ['Alder']
+        params = ['Inflow']
+    elif project == 'Cushman':
+        locs = ['Cushman1']
+        params = ['Inflow']
+    elif project == 'Wynoochee':
+        locs = ['Wynoochee', 'Cushman1']
+        params = ['Inflow', 'Inflow']
+    else:
+        print('Need one os Cowlitz, Nisqually, Cushman1, Wynoochee')
+
+    # get the query string
+    query_string = make_empirical_flow_query_string(start, end, locs, params)
+    # query the database
+    df = query_pmdb(query_string)
+    # datetime wrangle
+    df['dt_weather'] = pd.to_datetime(df.RecordDateID, 
+                    format="%Y%m%d").dt.tz_localize('US/Pacific')
+    # pivot table
+    piv =  df.pivot_table(index = 'dt_weather', columns = ['Loc','Param'], values  = 'Value')
+    # sideflows are 0 for Nisqually Cushman and Wynoochee
+    if project in ['Nisqually', 'Cushman', 'Wynoochee']:
+        piv[(project, 'Sideflow')] = 0
+
+    # wrangle
+    rename_cols0 = {'Mossyrock': 'Cowlitz', 'Mayfield': 'Cowlitz',
+                    'Alder': 'Nisqually', 'Cushman1':'Cushman'} 
+    rename_cols1 = {'Inflow':'inflow_cfs', 'Sideflow':'sideflow_cfs'}
+    piv.rename(columns=rename_cols0, level=0, inplace=True)
+    piv.rename(columns=rename_cols1, level=1, inplace=True)
+
+    # return piv
+    piv =  piv.sort_index(axis=1)
+    
+    # Split the inflows into a dictionary of separate DFs resource name (location)
+    inflow_dfs = {}
+    hydro_resource_names = piv.columns.get_level_values(level=0).drop_duplicates()
+    for resource_name in hydro_resource_names:
+        inflow_dfs[resource_name] = piv[resource_name]
+        inflow_dfs[resource_name].columns.name = None
+
+    # Wynoochee has limited data.  Based on analysis elsewhere, a simple multiplier on Cushman is a reasonable estimate 
+    # and better at extrapolation than quantile scaling.
+    if 'Wynoochee' in locs:
+        cush_wyn_flow_converstion_factor = 0.6366824153681291
+        if 'Wynoochee' in inflow_dfs:
+            inflow_dfs['Wynoochee'] = inflow_dfs['Wynoochee'].combine_first(inflow_dfs['Cushman'] * cush_wyn_flow_converstion_factor )
+        else:
+            inflow_dfs['Wynoochee'] = inflow_dfs['Cushman'] * cush_wyn_flow_converstion_factor
+    
+    # clip the negatives [TODO: discuss if this is correct]
+    if clip_neg:
+        for key, df in inflow_dfs.items():
+            inflow_dfs[key] = df.clip(lower=0)
+    
+    return inflow_dfs[project]
+
+# Historical data for system parameters
+## These functions hit the PM database, which doesn't go back too far
+
+def historical_load_database(start, end):
+    start = start.replace("-", "")
+    end = end.replace("-", "")
+    date_field = 'PTPeriodEndDateID'
+    query_string = make_left_join_query_string(
+                    left_table = 'Fact_Load_HourlyMWh',
+                    right_tables = ['DimLoadType', 'DimLoadAndPeak'],
+                    left_right_join_cols = [('LoadTypeID', 'ID'), ('LoadAndPeakID', 'ID')],
+                    right_keep_cols_rename = [('LoadTypeName','LoadTypeName'), ('IsHLH','IsHLH')],
+                    left_cols = ['UTCPeriodEndDateTime', 'MWh'])
+    query_string += "WHERE DimLoadType.LoadTypeName = 'System Load' "
+    query_string += f"AND {date_field} >= {start} AND {date_field} <= {end} "
+    query_df = query_pmdb(query_string)
+    query_df = wrangle_datetime_utc_to_pac2(query_df)
+    query_df.drop(columns=['day_of_week', 'date'], inplace=True)
+    return query_df
+
+def historical_BA_load_database(start, end):
+    start = start.replace("-", "")
+    end = end.replace("-", "")
+    date_field = 'PTPeriodEndDateID'
+    query_string = make_left_join_query_string(
+                    left_table = 'Fact_Load_HourlyMWh',
+                    right_tables = ['DimLoadType', 'DimLoadAndPeak'],
+                    left_right_join_cols = [('LoadTypeID', 'ID'), ('LoadAndPeakID', 'ID')],
+                    right_keep_cols_rename = [('LoadTypeName','LoadTypeName'), ('IsHLH','IsHLH')],
+                    left_cols = ['UTCPeriodEndDateTime', 'MWh'])
+    query_string += "WHERE DimLoadType.LoadTypeName = 'BA Load' "
+    query_string += f"AND {date_field} >= {start} AND {date_field} <= {end} "
+    query_df = query_pmdb(query_string)
+    query_df = wrangle_datetime_utc_to_pac2(query_df)
+    query_df.drop(columns=['day_of_week', 'date'], inplace=True)
+    return query_df
+
+def get_slice():
+    """This function just grabs all the slice.
+    TODO: add a time filter - start and end"""
+    query_string = 'SELECT * FROM Fact_Slice_RightToPower'
+    slice = query_pmdb(query_string)
+    slice['dt'] = slice.UTCRecordDateTime.dt.tz_localize('UTC').dt.tz_convert('US/Pacific')
+    slice = slice.set_index('dt')
+    slice = pd.DataFrame(slice['RightToPower'].resample('H').mean())
+    slice.rename(columns={'RightToPower': 'slice_mw'}, inplace=True)
+    return slice
+
+def historical_temp_database(start, end):
+    '''Note there is a different temperature database with a more complete
+    Dataset - queries are below'''
+    start = start.replace("-", "")
+    end = end.replace("-", "")
+    date_field = 'PTHourEndDateID'
+    query_string = make_left_join_query_string(
+                    left_table = 'Fact_Temperature_Actuals_Hourly',
+                    right_tables = ['DimWeatherLocations'],
+                    left_right_join_cols = [('WeatherLocationID', 'ID')],
+                    right_keep_cols_rename = [('LocationCode','LocationCode')],
+                    left_cols = ['UTCHourEndDateTime', 'Temperature_Fahrenheit'])
+    query_string += f"WHERE {date_field} >= {start} AND {date_field} <= {end} "
+    query_df = query_pmdb(query_string)
+    query_df = wrangle_datetime_utc_to_pac2(query_df, utc_period_end_col='UTCHourEndDateTime')
+    query_df.drop(columns=['day_of_week', 'date'], inplace=True)
+    return query_df
+
+def historical_price_database(start, end):
+    start = start.replace("-", "")
+    end = end.replace("-", "")
+    date_field = 'PTRecordDateID'
+    query_string = make_left_join_query_string(
+                            left_table = 'Fact_Powerdex',
+                            right_tables = [],
+                            left_right_join_cols = [],
+                            right_keep_cols_rename = [],
+                            left_cols = ['UTCRecordDateTime', 'VWAverage'])
+    query_string += f"WHERE {date_field} >= {start} AND {date_field} <= {end} "
+    query_df = query_pmdb(query_string)
+    
+    query_df = wrangle_datetime_utc_to_pac2(query_df, utc_period_end_col='UTCRecordDateTime')
+    query_df.drop(columns=['day_of_week', 'date'], inplace=True)
+    return query_df
+
+def historical_gen_database_query_string(start, end):
+    start = start.replace("-", "")
+    end = end.replace("-", "")
+    date_field = 'PTPeriodEndDateID'
+    query_string = make_left_join_query_string(
+                        left_table = 'Fact_Generation_ByGeneratorEMSTag_HourlyMWh',
+                        right_tables = ['DimGenerator', 'DimPowerPlant', 'DimProject'],
+                        left_right_join_cols = [('GeneratorID', 'ID'), 
+                                                ('PowerPlantID', 'ID'),
+                                                ('ProjectID',  'ID')],
+                        right_keep_cols_rename = [('Name', 'GeneratorName'),
+                                                ('PlantCode',  'Loc'),
+                                                ('ProjectCode', 'ProjectCode')],
+                        left_cols = ['UTCPeriodEndDateTime', 'MWh'])  
+    
+    # SourceID=13 Oracle, SourceID=14 PMSQLDB  we use 13 prior to 2009
+    query_string += f"WHERE ({date_field} >= {start} AND {date_field} < 20090101 AND {date_field} < {end} AND SourceID=13) or ({date_field} >= {start} AND {date_field} <= {end} AND SourceID=14) "
+    
+    return query_string
+
+def historical_gen_database(start, end):
+    return query_pmdb(historical_gen_database_query_string(start, end))
+
+def get_system_weather_year_data_database(start, end, freq='H'): 
+    '''This function make the timeseries df, calls the previous 4 query functions and wrangles the results.
+    This only returns a limited data set.  
+    '''   
+    df = make_dt_df(start, end, freq=freq)
+
+    # merge query data
+    merge_funcs = [historical_load_database, historical_temp_database, 
+                   historical_price_database, historical_slice_database]
+    for func in merge_funcs:
+        df = df.merge(func(start, end), left_index=True, right_index=True, how='left')
+
+    col_names = {'MWh':'load_MWh', 
+                'Temperature_Fahrenheit':'temp_degF', 
+                'VWAverage': 'price_pMWh', 
+                'IsHLH': 'isHLH'} 
+
+    drop_cols = ['LoadTypeName', 'LocationCode', 'dt_utc', 'time_delta_hr', 'date']
+    df.rename(columns=col_names, inplace=True)
+    df.drop(columns=drop_cols, inplace=True)
+    
+    return df
+
+# Functions to Work with Historical Temperature Data 
+
+def get_temp_daily_max_min_data_warehouse(input_data_start, input_data_end):
+    '''Read data start/end and pull temperatures from PMDW
+    '''
+    start = pd.to_datetime(input_data_start).strftime('%Y%m%d')
+    end = pd.to_datetime(input_data_end).strftime('%Y%m%d')
+
+    # get daily max/min temperatures from data warehouse
+
+    # make query string
+    query_string_temp_max_min = f"""select a.RecordDateID, a.ReadingValue, ReadingType
+
+    from Fact_WeatherBankDaily as a
+    inner join DimWeatherBankStationCode as b on a.StationCodeID = b.ID
+    inner join DimWeatherBankReadingType as c on a.ReadingTypeID = c.ID
+    inner join DimWeatherBankDataType as d on a.DataTypeID = d.ID
+    where a.DataTypeID = 1 
+    and (a.ReadingTypeID = 14
+    or a.ReadingTypeID = 20)
+    and b.StationCode = 'KSEA'
+    and a.RecordDateID >= {start}
+    and a.RecordDateID <= {end}
+    """
+
+    df_hist_temp_max_min = query_pmdb(query_string_temp_max_min)
+    df_hist_temp_max_min.ReadingValue = pd.to_numeric(df_hist_temp_max_min.ReadingValue, errors='coerce')
+
+    df_hist_temp_max_min = df_hist_temp_max_min.pivot_table(index='RecordDateID', values='ReadingValue', columns='ReadingType')
+    df_hist_temp_max_min.columns.rename('',inplace=True)
+    df_hist_temp_max_min.index = pd.to_datetime(df_hist_temp_max_min.index, format="%Y%m%d").tz_localize('US/Pacific')
+    df_hist_temp_max_min.index.name = 'dt_weather'
+
+    return df_hist_temp_max_min
+
+def read_parquet_from_folder(read_folder):
+    # Dictionary to store the loaded dataframes
+    loaded_dfs = {}
+
+    # Load each Parquet file into a dataframe and store it in the dictionary
+    for file_name in os.listdir(read_folder):
+        if file_name.endswith('.parquet'):
+            key = file_name.replace('.parquet', '')
+            file_path = os.path.join(read_folder, file_name)
+            loaded_dfs[key] = pd.read_parquet(file_path)
+    return loaded_dfs
+
+def get_temp_daily_max_min():
+    read_folder = r"\\fs109\PUBLIC\PowerManagement\IRP Working\ModelDataInput\historical_temp"
+    dfs = read_parquet_from_folder(read_folder)
+    return dfs['seatac']
+
+def read_historical_temp_data(dt_df):
+    '''Reads historical temp data and puts it in a format for the load regression.
+    Note the function automatically foreward fills or back fills NAs.'''
+    temp_df = get_temp_daily_max_min()
+    
+    # merge
+    temp_df.index = temp_df.index.tz_localize(None)
+    cols = {'MAX':'temp_daily_max_F', 'MIN':'temp_daily_min_F'}
+    ## ffill automatically fills in NAs
+    temp_df = dt_df.merge(temp_df, how='left', 
+                          left_on='dt_weather', 
+                          right_index=True).ffill().rename(columns=cols)
+    
+    ## bfill automatically fills in NAs in case NA is the start 
+    cols = ['temp_daily_max_F', 'temp_daily_min_F']
+    temp_df[cols] = temp_df[cols].bfill() 
+
+    # wrangle
+    temp_df = classify_load_hours(temp_df)
+    temp_df['hour'] = temp_df.index.hour
+    temp_df['day_of_week'] = temp_df.index.day_of_week
+    # Override holidays as day of week 7
+    temp_df['day_of_week_hol'] = np.where(~pd.isnull(temp_df.holiday), 7, temp_df.day_of_week)
+    temp_df['day_of_year'] = temp_df.index.day_of_year
+    return temp_df
+
+def get_prev_date(date):
+    # convert the string to a pandas datetime object
+    dt = pd.to_datetime(date)
+    # subtract one day (the result is also a pandas datetime object)
+    previous_date = dt - pd.Timedelta(days=1)
+    # if you need the result as a string in the same format
+    previous_date_str = previous_date.strftime('%Y-%m-%d')
+    return previous_date_str
+
+def get_elevs(date):
+    '''Get startings elevations from a specific day.  
+    '''
+    # query
+    start = get_prev_date(date)      
+    end = date
+    locs = ['Mossyrock', 'Mayfield', 'Alder', 'Lagrande', 
+            'Cushman1', 'Cushman2', 'Wynoochee']
+    params=['EOPElevation']*len(locs)
+    query_str = make_empirical_flow_query_string(start, end, locs, params)
+    elevs = query_pmdb(query_str)
+
+    # dict format
+    lookup = {'Cowlitz': {'upper': 'Mossyrock', 'lower': 'Mayfield'}, 
+            'Nisqually': {'upper': 'Alder',  'lower': 'LaGrande'}, 
+            'Cushman' : {'upper': 'Cushman1',  'lower':'Cushman2'}, 
+            'Wynoochee': {'upper': 'Wynoochee'}}
+
+    init_elevs = {}
+    for key, value in lookup.items():
+        proj_elevs = {}
+        for sub_key, sub_value in value.items():
+            mask = elevs.Loc == sub_value
+            elev = elevs.loc[mask, 'Value'].values[0]
+            proj_elevs[sub_key] = elev
+        init_elevs[key] = proj_elevs
+    init_elevs['Wynoochee']['lower'] = 0.
+    return init_elevs
+
+######################
+# HLH LLH Calculations
+######################
+
+# make a new holiday
+USThanksgivingDayAfter = Holiday(
+    "Thanksgiving Day After", month=11, day=1, offset=pd.DateOffset(weekday=FR(4))
+)
+
+# ID FERC holidays - it might not be perfect (hence "like")
+class FercLikeCalendar(AbstractHolidayCalendar):
+    rules = [
+        USMemorialDay, 
+        USLaborDay, 
+        USThanksgivingDay,
+        USThanksgivingDayAfter,
+        Holiday('July 4th', month=7, day=4, observance=nearest_workday), 
+        Holiday('July 4th', month=7, day=4),
+        Holiday('New Years', month=1, day=1, observance=nearest_workday), 
+        Holiday('New Years', month=1, day=1), 
+        Holiday('Christmas', month=12, day=25, observance=nearest_workday), 
+        Holiday('Christmas', month=12, day=25), 
+       ]
+ 
+def get_holidays(start_year, end_year):
+    """get FERC holidays take the start year and the end year as arguments
+    and returns a Pandas Series with the holidays"""
+    cal = FercLikeCalendar()
+    holidays = cal.holidays(start=pd.Timestamp(start_year, 1, 1), end=pd.Timestamp(end_year + 1,1,1), return_name=True)
+    holidays.index = pd.to_datetime(holidays.index).date
+    holidays.name = 'holiday'
+    dups = (holidays.duplicated()) & (holidays.index.duplicated())
+    return holidays[~dups]
+
+def classify_load_hours(df):
+    """Arguments
+    Pandas DataFrame with an hourly dt index
+    """
+    if 'date' not in df.columns:
+        df['date'] = df.index.date
+    holidays = get_holidays(int(df.index.year.min()), int(df.index.year.max()))
+    light_load_hours = (
+            (df.index.hour.isin([0, 1, 2, 3, 4, 5, 22, 23])) |
+            (df.index.dayofweek == 6) |                                          
+            (pd.Series(df.index.date).isin(holidays.index).values)
+    )
+    # Set load classification for light load hours
+    df.loc[light_load_hours, 'HLH_LLH'] = 'LLH'
+    # Set load classification for heavy load hours
+    df.loc[~light_load_hours, 'HLH_LLH'] = 'HLH'
+    df = df.merge(holidays, left_on='date', right_index=True, how='left')
+    return df
+
+
+def sqlite_to_duckdb(sqlite_path, duckdb_path):
+    # Create SQLAlchemy engine for SQLite
+    sqlite_engine = sa.create_engine(f'sqlite:///{sqlite_path}')
+    
+    # Create SQLAlchemy engine for DuckDB
+    duckdb_engine = sa.create_engine(f'duckdb:///{duckdb_path}')
+
+    # Reflect the SQLite database structure
+    sqlite_metadata = sa.MetaData()
+    sqlite_metadata.reflect(bind=sqlite_engine)
+
+    with sqlite_engine.connect() as sqlite_connection:
+        # Iterate over each table in the SQLite database
+        for table_name, table in sqlite_metadata.tables.items():
+            print(f"Starting {table_name}")
+            # Read the table data into a Pandas DataFrame
+            df = pd.read_sql_table(table_name, con=sqlite_connection)
+            print(f"Read: {table_name}")
+            
+            # Write the DataFrame to the DuckDB database
+            df.to_sql(table_name, con=duckdb_engine, if_exists='replace', index=False)
+            print(f"Table {table_name} has been transferred to DuckDB.")
+    
+    print("Data transfer complete.")
+
+def classify_load_days(df):
+    # make an hourly index
+    dt_df = make_dt_df(df.index.min(), df.index.max())
+    # add HHL flag
+    dt_df = classify_load_hours(dt_df)
+    # reduce down
+    dt_df['HLHCount'] = (dt_df.HLH_LLH == 'HLH').astype(int)
+    # Get the daily count
+    hlh_count = dt_df['HLHCount'].resample("D").sum()
+    return df.merge(hlh_count, left_index=True, right_index=True, how='left')
+
+class SummerHolidayCalendar(AbstractHolidayCalendar):
+    rules = [
+        USMemorialDay, 
+        USLaborDay, 
+        Holiday('Day After Labor Day',  month=9, day=2, offset=pd.DateOffset(weekday=TU(1))),
+        Holiday('New Years', month=1, day=1)
+    ]
+
+def get_summer_winter_holidays(start_year, end_year):
+    """Get holidays takes the start year and the end year as arguments
+    and returns a Pandas Series with the holidays"""
+    cal = SummerHolidayCalendar()
+    holidays = cal.holidays(start=pd.Timestamp(start_year, 1, 1), end=pd.Timestamp(end_year, 12, 31), return_name=True)
+    holidays.index = pd.to_datetime(holidays.index).date
+    holidays.name = 'summer_winter_holiday'
+    dups = (holidays.duplicated()) & (holidays.index.duplicated())
+    return holidays[~dups]
+
+###########################################################
+# The following functions get climate data temperature csvs
+###########################################################
+
+def read_climate_model_temp_data_file(year, gcm, gg_scenario, downscaling_method):
+    path0 = rf"\\fs109\PUBLIC\PowerManagement\IRP Working\ModelDataInput\Temp_climate_model"
+    file0 = rf"\{year}_combined_Seatac_{gg_scenario}_{downscaling_method}_{gcm}.csv"
+    path_file = path0 + file0
+    df = pd.read_csv(path_file, usecols=["date", "tmax", "tmin"])
+    df.tmax = celsius_to_fahrenheit(df.tmax)
+    df.tmin = celsius_to_fahrenheit(df.tmin)
+    df.rename(columns={"date":'dt_weather', 
+                       "tmax":'temp_daily_max_F',
+                       "tmin":'temp_daily_min_F'}, 
+              inplace=True)
+    df.dt_weather = pd.to_datetime(df.dt_weather)
+    df.set_index('dt_weather', inplace=True)
+    return df
+
+def read_climate_model_temp_data_files(input_data_start, input_data_end, 
+                                       gcm, gg_scenario, downscaling_method):
+    # Wrangle the date string.  End year is not inclusive
+    start_year = int(input_data_start[:4])
+    end_year = int(input_data_end[:4])
+    years = range(start_year, end_year+1)
+    dfs = []
+    for year in years:
+        dfs.append(read_climate_model_temp_data_file(year, gcm, gg_scenario, downscaling_method))
+    combined_df =  pd.concat(dfs)
+    mask = ((combined_df.index >= pd.to_datetime(input_data_start)) & 
+            (combined_df.index < pd.to_datetime(input_data_end)))
+    combined_df =  combined_df[mask]
+    # combined_df.index = combined_df.index.tz_localize('US/Pacific')
+    return combined_df
+
+def read_filter_climate_model_temp_data(input_data_start, input_data_end, 
+                                   gcm, gg_scenario, downscaling_method):
+    path0 = rf"\\fs109\PUBLIC\PowerManagement\IRP Working\ClimateChange\Data\TemperatureProjections\max_min"
+    file0 = rf"\forcing_Seatac_{gg_scenario}_{downscaling_method}_{gcm}.csv"
+    path_file = path0 + file0
+    df = pd.read_csv(path_file, usecols=["Unnamed: 0", "tmax", "tmin"])
+    df.tmax = celsius_to_fahrenheit(df.tmax)
+    df.tmin = celsius_to_fahrenheit(df.tmin)
+    df.rename(columns={"Unnamed: 0":'dt_weather', 
+                       "tmax":'temp_daily_max_F',
+                       "tmin":'temp_daily_min_F'}, 
+              inplace=True)
+    df.dt_weather = pd.to_datetime(df.dt_weather)
+    df.set_index('dt_weather', inplace=True)
+    mask = ((df.index >= pd.to_datetime(input_data_start)) & 
+            (df.index < pd.to_datetime(input_data_end)))
+    return df[mask]
+    
+
+def read_climate_temp_data(dt_df, gcm, gg_scenario, downscaling_method):
+    '''Reads climate temp data and puts it in ah hourly format for the load regression'''
+    start = dt_df.at[dt_df.index[0], 'dt_weather'].strftime('%Y-%m-%d')
+    end = dt_df.at[dt_df.index[-1], 'dt_weather'].strftime('%Y-%m-%d')
+    temp_df = read_filter_climate_model_temp_data(start, end, 
+                                                 gcm, gg_scenario, downscaling_method)
+    
+    temp_df = dt_df.merge(temp_df, how='left', 
+                          left_on='dt_weather', right_index=True).ffill()
+
+    # wrangle
+    temp_df = classify_load_hours(temp_df)
+    temp_df['hour'] = temp_df.index.hour
+    temp_df['day_of_week'] = temp_df.index.day_of_week
+    
+    # Override holidays as day of week 7
+    temp_df['day_of_week_hol'] = np.where(~pd.isnull(temp_df.holiday), 7, temp_df.day_of_week)
+    temp_df['day_of_year'] = temp_df.index.day_of_year
+    return temp_df
+
+################################
+# Load Climate Model Flow Data
+################################
+
+# Handy lists of climate model ensemble parameters 
+gcms = ['CNRM-CM5', 'GFDL-ESM2M', 'CSIRO-Mk3-6-0', 'HadGEM2-ES', 'CCSM4', 
+        'inmcm4', 'IPSL-CM5A-MR', 'MIROC5', 'HadGEM2-CC', 'CanESM2']
+gg_scenarios = ['RCP45', 'RCP85']
+downscaling_methods = ['MACA', 'BCSD']
+hydraulic_methods = ['VIC_P2', 'VIC_P1', 'PRMS_P1', 'VIC_P3']
+
+def read_climate_model_data_file(year, loc, gcm, gg_scenario, downscaling_method, hydraulic_method,
+                    path0 = rf"\\fs109\PUBLIC\PowerManagement\IRP Working\ModelDataInput\Inflows_climate_model"):
+    '''Read a single climate model data file and return a DataFrame'''
+    # Wynoochee has a different file name format
+    if loc == 'WYD':
+        file0 = rf"\{year}_{loc}_{gcm}_{gg_scenario}_{downscaling_method}_{hydraulic_method}"
+        file1 = rf"_scaled.csv"
+    else:
+        file0 = rf"\{year}_{gcm}_{gg_scenario}_{downscaling_method}_{hydraulic_method}"
+        file1 = rf"-{loc}-biascorrected_streamflow-1.0.csv"
+
+    path_file = path0 + file0 + file1
+    df = pd.read_csv(path_file, usecols=['date', 'biascorrected_streamflow'])
+    df.date = pd.to_datetime(df.date)
+    df.rename(columns={'date':'weather_dt',
+                       'biascorrected_streamflow':'flow_cfs'}, 
+                inplace=True)
+    df.set_index('weather_dt', inplace=True)
+    df.index = df.index.tz_localize("US/Pacific")
+    return df
+
+def read_climate_model_data_files(input_data_start, input_data_end, loc, gcm, gg_scenario, 
+                                  downscaling_method, hydraulic_method):
+    ''''''
+    # Wrangle the date string.  End year is not inclusive
+    start_year = int(input_data_start[:4])
+    end_year = int(input_data_end[:4])
+    years = range(start_year, end_year+1)
+    dfs = []
+    for year in years:
+        dfs.append(
+            read_climate_model_data_file(year, loc, gcm, gg_scenario, downscaling_method, hydraulic_method)
+        )
+    combined_df =  pd.concat(dfs)
+    # filter the date range
+
+    mask = ((combined_df.index >= pd.to_datetime(input_data_start).tz_localize("US/Pacific")) & 
+            (combined_df.index < pd.to_datetime(input_data_end).tz_localize("US/Pacific")))
+    return combined_df[mask]
+
+def read_filter_climate_model_data(input_data_start, input_data_end, 
+                                   loc, gcm, gg_scenario, 
+                                   downscaling_method, hydraulic_method, 
+                                    bias_corrected=True):
+    """This version reads one CSV per loc/ run and then filters"""
+    path0 = rf"\\fs109\PUBLIC\PowerManagement\IRP Working\ClimateChange\Data\FlowProjections_uw160"
+    path1 = rf"\streamflow-1.0-{loc}\{loc}"
+    file0 = rf"\{gcm}_{gg_scenario}_{downscaling_method}_{hydraulic_method}-"
+
+    if bias_corrected:
+        path2 = rf"\biascorrected_streamflow"
+        file1 = rf"{loc}-biascorrected_streamflow-1.0.csv"
+    else:
+        path2 = rf"\streamflow"
+        file1 = rf"{loc}-streamflow-1.0.csv"
+    
+    path_file = path0 + path1 + path2 + file0 + file1
+    df = pd.read_csv(path_file, skiprows=38)
+    df.date = pd.to_datetime(df.date)
+
+    df.rename(columns={'date':'weather_dt',
+                       'biascorrected_streamflow':'flow_cfs', 
+                       'streamflow':'flow_cfs'}, 
+                       inplace=True)
+    df.set_index('weather_dt', inplace=True)
+    df.index = df.index.tz_localize("US/Pacific")
+    
+    mask = ((df.index >= pd.to_datetime(input_data_start).tz_localize("US/Pacific")) & 
+            (df.index < pd.to_datetime(input_data_end).tz_localize("US/Pacific")))
+    return df[mask]
+
+
+def inflow_climate_data_load(input_data_start, input_data_end, gcm, gg_scenario, 
+                             downscaling_method, hydraulic_method,
+                             resource_names = ['Cowlitz', 'Nisqually', 'Cushman', 'Wynoochee']):
+    inflow_dfs = {}
+    for resource_name in resource_names:
+        if resource_name=='Cowlitz':
+            inflow = read_filter_climate_model_data(input_data_start, input_data_end, 
+                                               'MOS', gcm, gg_scenario, 
+                                               downscaling_method, hydraulic_method)
+            inflow.rename(columns={'flow_cfs':'inflow_cfs'}, inplace=True)
+            
+            sideflow = read_filter_climate_model_data(input_data_start, input_data_end, 
+                                               'MMM', gcm, gg_scenario, 
+                                               downscaling_method, hydraulic_method)
+            sideflow.rename(columns={'flow_cfs':'sideflow_cfs'}, inplace=True)
+            
+            inflow_dfs[resource_name] = pd.concat([inflow, sideflow], axis=1)
+        
+        elif resource_name=='Nisqually':
+            inflow = read_filter_climate_model_data(input_data_start, input_data_end, 
+                                               'ALD', gcm, gg_scenario, 
+                                               downscaling_method, hydraulic_method)
+            inflow.rename(columns={'flow_cfs':'inflow_cfs'}, inplace=True)
+            inflow['sideflow_cfs'] = 0
+            inflow_dfs[resource_name] = inflow
+        
+        elif resource_name=='Cushman':
+            inflow = read_filter_climate_model_data(input_data_start, input_data_end, 
+                                               'CS2', gcm, gg_scenario, 
+                                               downscaling_method, hydraulic_method)
+            inflow.rename(columns={'flow_cfs':'inflow_cfs'}, inplace=True)
+            inflow['sideflow_cfs'] = 0
+            inflow_dfs[resource_name] = inflow
+
+        elif resource_name=='Wynoochee':
+            inflow = read_filter_climate_model_data(input_data_start, input_data_end, 
+                                               'WYD', gcm, gg_scenario, 
+                                               downscaling_method, hydraulic_method, 
+                                               bias_corrected=False)
+            inflow.rename(columns={'flow_cfs':'inflow_cfs'}, inplace=True)
+            inflow['sideflow_cfs'] = 0
+            inflow_dfs[resource_name] = inflow
+        
+        else:
+            print('Bad hydroresource name')
+        
+    return inflow_dfs
+
+def get_climate_model_dalles_natural_monthly_inflows_csv(
+            gcm=None, 
+            gg_scenario=None, 
+            downscaling_method=None, 
+            hydraulic_method=None,
+            path = r'\\fs109\PUBLIC\PowerManagement\IRP Working\ModelDataInput\bpa_inflows\uw160'):
+    file = rf"\{gcm}_{gg_scenario}_{downscaling_method}_{hydraulic_method}-TDA-monthly.csv"
+
+    df = pd.read_csv(path+file)
+    df.set_index('dt', inplace=True, drop=True)
+    return df
+
+
+############################################################
+# Load BPA Inflow Data from IRPWorking/ModelDataInput/slice
+############################################################
+
+# read bpa inflow data and calculate cumulative sum
+def read_bpa_inflow_data(input_data_start, input_data_end):
+    # magic number
+    cum_sum_days = 100 # 100 days
+
+    # get historical inflows
+
+    # get historical gcd
+    gcd_path = rf"\\fs109\PUBLIC\PowerManagement\IRP Working\ModelDataInput\slice\GCL6ARF_daily.csv"
+    ihr_path = rf"\\fs109\PUBLIC\PowerManagement\IRP Working\ModelDataInput\slice\IHR6ARF_daily.csv"
+
+    df_inflow_gcd_cfs = pd.read_csv(gcd_path)
+    df_inflow_gcd_cfs.set_index('date',inplace=True)
+    df_inflow_gcd_cfs.index = pd.to_datetime(df_inflow_gcd_cfs.index)
+    df_inflow_gcd_cfs.columns=['inflow_gcd_cfs']
+    df_inflow_gcd_cfs['inflow_gcd_cum_sum_cfs'] = df_inflow_gcd_cfs['inflow_gcd_cfs'].rolling(window=cum_sum_days, min_periods=1).sum()
+
+    # get historical snake
+    df_inflow_ihr_cfs = pd.read_csv(ihr_path)
+    df_inflow_ihr_cfs.set_index('date',inplace=True)
+    df_inflow_ihr_cfs.index = pd.to_datetime(df_inflow_ihr_cfs.index)
+    df_inflow_ihr_cfs.columns=['inflow_ihr_cfs']
+    df_inflow_ihr_cfs['inflow_ihr_cum_sum_cfs'] = df_inflow_ihr_cfs['inflow_ihr_cfs'].rolling(window=cum_sum_days, min_periods=1).sum()
+
+    # localize inflow timezone to 'US/Pacific'
+    df_inflow_gcd_cfs.index = df_inflow_gcd_cfs.index.tz_localize(tz='US/Pacific')
+    df_inflow_ihr_cfs.index = df_inflow_ihr_cfs.index.tz_localize(tz='US/Pacific')
+
+    # make inflow data hourly
+    df_inflow_gcd_cfs = df_inflow_gcd_cfs.resample('H').ffill()
+    df_inflow_ihr_cfs = df_inflow_ihr_cfs.resample('H').ffill()
+
+    
+    # isolate df by start/end date
+    df_inflow_ihr_cfs = df_inflow_ihr_cfs.loc[(df_inflow_ihr_cfs.index >= input_data_start) & (df_inflow_ihr_cfs.index < input_data_end)]
+    df_inflow_gcd_cfs = df_inflow_gcd_cfs.loc[(df_inflow_gcd_cfs.index >= input_data_start) & (df_inflow_gcd_cfs.index < input_data_end)]
+
+    # combine dfs
+    bpa_inflows_df = pd.concat([df_inflow_gcd_cfs, df_inflow_ihr_cfs],axis=1)
+
+    # fillna
+    bpa_inflows_df.fillna(method='ffill', inplace=True)
+
+    return bpa_inflows_df
+
+######################################################
+# Load Historical Slice RTP (Right to Power) from PMDW
+#######################################################
+
+def read_historical_rtp(input_data_start, input_data_end):
+    # magic number
+    ra_time = 24 * 14 # two weeks
+
+    # query PMDB for historical Slice Right to Power (RTP)
+    query_string = "SELECT UTCRecordDateTime, RightToPower FROM Fact_Slice_RightToPower"
+    df_raw = query_pmdb(query_string)
+    
+    # wrangle datetime
+    df_rtp = df_raw.sort_values('UTCRecordDateTime')
+    df_rtp = df_rtp.set_index('UTCRecordDateTime')
+
+    # convert from tz-naive to  tz-aware (UTC)
+    df_rtp.index = df_rtp.index.tz_localize('UTC')
+    df_rtp.index = df_rtp.index.floor('H')
+    
+    # convert to US/Pacific
+    df_rtp.index = df_rtp.index.tz_convert('US/Pacific')
+    df_rtp['date'] = df_rtp.index.date
+    df_rtp.rename(columns={"RightToPower": "rtp"},inplace=True)
+
+    # isolate date for regression
+    # TODO update as more data becomes available
+    df_rtp = df_rtp.loc[(df_rtp.index >= input_data_start) & (df_rtp.index < input_data_end)]
+
+    # get average HLH, LLH, and ffill hourly values
+    df_rtp['daily_rtp_avg_HLH'] = df_rtp[['rtp']].loc[(df_rtp.index.hour > 6) & (df_rtp.index.hour <22)].resample('D').mean().resample('H').ffill()
+    df_rtp['daily_rtp_avg_LLH']  = df_rtp[['rtp']].loc[(df_rtp.index.hour < 7) | (df_rtp.index.hour > 21)].resample('D').mean().resample('H').ffill()
+
+    # calculate daily max/min RTP
+    df_rtp['daily_rtp_max'] = df_rtp.groupby(df_rtp['date'])['rtp'].transform('max')
+    df_rtp['daily_rtp_min'] = df_rtp.groupby(df_rtp['date'])['rtp'].transform('min')
+    df_rtp['daily_rtp_avg'] = df_rtp.groupby(df_rtp['date'])['rtp'].transform('mean')
+
+    # calculate rolling average
+    df_rtp['daily_rtp_min_ra'] = df_rtp[['daily_rtp_min']].rolling(window=ra_time, min_periods=1).mean()
+    df_rtp['daily_rtp_max_ra'] = df_rtp[['daily_rtp_max']].rolling(window=ra_time, min_periods=1).mean()
+
+    # fillna with ffill
+    df_rtp.fillna(method='ffill', inplace=True)
+
+    return df_rtp
+    
+
+###########################################################
+# The following functions work with SQLite .db files
+###########################################################
+
+def setup_database(db_name):
+    """
+    Set up a SQLite database.
+    
+    :param db_name: Name of the SQLite database file.
+    :return: None
+    """
+    conn = sqlite3.connect(db_name)
+    conn.close()
+    print(f'Set up database {db_name}')
+
+def export_to_sqlite(df, db_name, table_name, run_id,  if_exists='replace', index=True):
+    """
+    Export a pandas DataFrame to a SQLite database with an additional column for model run ID.
+    
+    :param df: Pandas DataFrame.
+    :param db_name: Name of the SQLite database file.
+    :param table_name: Name of the table to which data will be exported.
+    :param run_id: ID to identify the specific model run.
+    :return: None
+    """
+    # Add a run_id column to the DataFrame
+    df['run_id'] = run_id
+    
+    # Connect to the database
+    conn = sqlite3.connect(db_name)
+    
+    # Export the DataFrame
+    df.to_sql(table_name, conn, if_exists=if_exists, index=index)
+    
+    # Close the connection
+    conn.close()
+
+def sqlite_query(db_name, query, wrangle_dt=False, dt_col_name='dt'):
+    """
+    Query data from the SQLite database.
+    
+    :param db_name: Name of the SQLite database file.
+    :param query: SQL query string.
+    :return: DataFrame containing the result of the query.
+    """
+    conn = sqlite3.connect(db_name)
+    result = pd.read_sql(query, conn)
+    if wrangle_dt:
+        result.set_index(dt_col_name, drop=True, inplace=True)
+        result.index = sqlite_string_to_tz_datetime(result.index)
+    conn.close()
+    return result
+
+
+def dict_of_dfs_to_parquet_files(dfs, run_name='run', folder='output', simulation_id='simulation'):
+    '''# Example usage:
+    # dfs = {"table1": df1, "table2": df2}
+    # dict_of_dfs_to_parquet_files(dfs, append=True) 
+    # This will append data to the specified existing Parquet files if they exist, else create new ones.'''
+    # Date and folder management
+    date = dt.datetime.now().strftime("%Y-%m-%d")
+    folder = os.path.join(folder, run_name +"_"+ date)
+    if not os.path.exists(folder):
+        os.makedirs(folder)
+    
+    # Iterate over the dictionary and handle each DataFrame
+    for table_name, df in dfs.items():
+        full_name = os.path.join(folder, f'{table_name}-{simulation_id}.parquet')
+        df.to_parquet(full_name, engine='pyarrow', compression='snappy', index=True)
+        print(f'Exported data to {full_name}')
+
+def dict_of_dfs_to_sqlite(dfs, filename='output', folder='..\\..\\..\\output', append=False, existing_db=None):
+    '''# Example usage:
+    # dfs = {"table1": df1, "table2": df2}
+    # dict_of_dfs_to_sqlite(dfs, append=True, existing_db="..\\..\\..\\output\\my_existing_file.db") 
+    # This will append data to the specified existing_db if table exists, else create a new one.'''
+    if not os.path.exists(folder):
+        os.makedirs(folder)
+    # Decide on the filename: use the provided existing_db or generate a new one
+    if existing_db:
+        full_name = existing_db
+    else:
+        # Date suffix for new files
+        date = dt.datetime.now().strftime("%Y-%m-%d")
+        full_name = folder + '\\' + filename + '_' + date + '.db'
+    
+    # Create or connect to an SQLite database
+    conn = sqlite3.connect(full_name)
+
+    # Define action based on the append flag
+    action = 'append' if append else 'replace'
+
+    # Iterate over the dictionary and write each DataFrame to a separate table
+    for table_name, df in dfs.items():
+        # Check if table exists and append is set to True
+        if append:
+            query = f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table_name}';"
+            existing_table = conn.execute(query).fetchone()
+            if not existing_table:
+                action = 'replace'
+            else:
+                action = 'append'
+        
+        # Write the table
+        df.to_sql(table_name, conn, if_exists=action, index=True)
+
+    # Close the SQLite connection
+    conn.close()
+
+    # Let the user know what happened
+    action_msg = "Appended data to" if append else "Exported data to"
+    print(f'{action_msg} file {full_name}')
+
+
+def get_db_table_names(db, column_names=False):
+    # Connect to the SQLite database
+    conn = sqlite3.connect(db)
+    cursor = conn.cursor()
+
+    # Fetch all table names
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+    tables = cursor.fetchall()
+    table_names = [table[0] for table in tables]
+
+    # If with_columns option is True, fetch columns for each table
+    if column_names:
+        table_column_dict = {}
+        for table_name in table_names:
+            cursor.execute(f"PRAGMA table_info({table_name});")
+            columns = cursor.fetchall()
+            cols = [column[1] for column in columns]  # Index 1 contains column name
+            table_column_dict[table_name] = cols
+        conn.close()
+        return table_column_dict
+    else:
+        conn.close()
+        return table_names
+
+
+def make_daterange_query_string(start_date, end_date, col = 'dt'):
+    return f'''
+        WHERE
+            substr({col}, 1, 10) >= '{start_date}' AND
+            substr({col}, 1, 10) <= '{end_date}' '''
+
+def sqlite_string_to_tz_datetime(index):
+    '''helper code from a common rough edge'''
+    return pd.to_datetime(index.str[:-6]).tz_localize('US/Pacific', ambiguous='infer')
+
+def get_recently_modified_files(directory, since_date, extension=".db"):
+    """
+    Get all files with a specific extension that have been modified since a given date.
+
+    Args:
+    - directory (str): The directory to search in.
+    - since_date (str): The date string in the format 'YYYY-MM-DD' to check modifications against.
+    - extension (str, optional): File extension to look for. Defaults to ".db".
+
+    Returns:
+    - List[str]: A list of file paths that match the criteria.
+    """
+    since_datetime = dt.datetime.strptime(since_date, '%Y-%m-%d')
+    
+    # List all files in the directory
+    all_files = [os.path.join(directory, f) for f in os.listdir(directory) if os.path.isfile(os.path.join(directory, f))]
+
+    # Filter files based on the modification date and extension
+    modified_files = [f for f in all_files if os.path.splitext(f)[1] == extension and dt.datetime.fromtimestamp(os.path.getmtime(f)) > since_datetime]
+
+    return modified_files
+
+def idx_db_col(conn, table, col):
+    '''This function creates an index out of a column which helps with database
+    Performance'''
+    conn.execute(f'CREATE INDEX IF NOT EXISTS idx_{table}_{col} ON {table}({col});')
+
+##############################
+# Functions to get USGS data
+##############################
+
+def get_usgs_data_csv(start_date, end_date, 
+                        path=r"\\fs109\PUBLIC\PowerManagement\IRP Working\ModelDataInput\bpa_inflows", 
+                        file=r"\Dalles_regulated_daily_1948_2023.csv",
+                        col_name='runoff_cfs'):
+    """
+    Reads historical runoff data from an Excel file for a given date range.
+    
+    Parameters:
+        start_date (str): The start date for data retrieval in the format 'YYYY-MM-DD'.
+    end_date (str): The end date for data retrieval in the format 'YYYY-MM-DD'.
+    path (str): The path to the Excel file.
+    file (str)
+    col_name (str): The column name in the Excel file that contains the runoff data. Default is 'flow_cfs'.
+
+    Returns:
+    pandas.DataFrame: A DataFrame containing the filtered runoff data within the specified date range.
+    """
+    file_path = os.path.join(path+file)
+    # Read the Excel file
+    df = pd.read_csv(file_path, usecols=['date', col_name])
+    
+    # Convert the 'date' column to datetime
+    df['date'] = pd.to_datetime(df['date'])
+    
+    # Filter the DataFrame based on the date range
+    mask = (df['date'] >= start_date) & (df['date'] <= end_date)
+    df = df.loc[mask]
+    df['date'] = df['date'].dt.tz_localize('US/Pacific', ambiguous='NaT', nonexistent='shift_forward')
+    
+    # Set the 'date' column as the DataFrame index
+    df.set_index('date', drop=True, inplace=True)
+    df.index.name = 'dt'
+
+    return df
+
+
+def get_usgs_data_url(start_date, end_date, 
+                  site_number = '14105700',  # Dalles
+                   parameter_code='00060',   # runoff
+                   col_name='runoff_cfs'):
+    """
+    Fetches historical runoff data from the USGS NWIS for a given site, date range, and parameter code.
+    By default, the parameter code is set to '00060', which stands for discharge, cubic feet per second (a common measure of runoff).
+
+    Parameters:
+    site_number (str): The USGS site number for the location.
+    start_date (str): The start date for data retrieval in the format 'YYYY-MM-DD'.
+    end_date (str): The end date for data retrieval in the format 'YYYY-MM-DD'.
+    parameter_code (str): The USGS parameter code for the type of data you want to retrieve. Default is '00060'.
+
+    Returns:
+    pandas.DataFrame: A DataFrame containing the retrieved runoff data.
+    """
+    base_url = "https://waterservices.usgs.gov/nwis/dv/"
+    params = {
+        'format': 'json',  # Format of the output
+        'sites': site_number,  # USGS site number
+        'startDT': start_date,  # Start date for data retrieval
+        'endDT': end_date,  # End date for data retrieval
+        'parameterCd': parameter_code,  # Parameter code for discharge
+        'siteStatus': 'all'  # Retrieve data for all site statuses
+    }
+
+    response = requests.get(base_url, params=params, verify=False)
+    data = response.json()
+
+    timeseries = data['value']['timeSeries'][0]['values'][0]['value']
+    dates = [entry['dateTime'] for entry in timeseries]
+    values = [float(entry['value']) for entry in timeseries]
+
+    df = pd.DataFrame({'dt': dates, col_name: values})
+    df['dt'] = pd.to_datetime(df['dt'])
+    df['dt'] = df['dt'].dt.tz_localize('US/Pacific', ambiguous='NaT', nonexistent='shift_forward')
+    df.set_index('dt', drop=True, inplace=True)
+    return df
+
+def get_usgs_data(start_date, end_date, csv=True):
+    if csv:
+        return get_usgs_data_csv(start_date, end_date)
+    else:
+        return get_usgs_data_url(start_date, end_date)
+     
+
+##############################
+# Function to pull down NOAA data
+##############################
+
+def kaf_to_cfs(volume_kaf, month, year):
+    # Number of days in each month (default to non-leap year)
+    days_in_month = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+
+    # Check for leap year and adjust February days
+    if (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0):
+        days_in_month[1] = 29  # February gets an extra day in a leap year
+
+    # Use the adjusted number of days for the specified month
+    days = days_in_month[month - 1]
+
+    # Convert KAF to cubic feet
+    volume_cubic_feet = volume_kaf * 1000 * 43560
+
+    # Calculate number of seconds in the month
+    seconds_in_month = days * 24 * 60 * 60
+
+    # Calculate average CFS
+    avg_cfs = volume_cubic_feet / seconds_in_month
+
+    return avg_cfs
+
+kaf_to_cfs_vec = np.vectorize(kaf_to_cfs)
+
+def get_data_embedded_in_html(url = "https://www.nwrfc.noaa.gov/natural/nat_norm_text.cgi?id=TDAO3"):
+    response = requests.get(url)
+    content = response.content.decode('utf-8')
+    csv_data = re.search(r'<pre>(.*?)</pre>', content, re.DOTALL).group(1)
+    csv_data = csv_data.replace('<br>', '\n').strip()
+    filtered_content = "\n".join([line for line in csv_data.splitlines() if not line.startswith('#') and not line.startswith('<')])
+    csv_io = StringIO(filtered_content)
+    df = pd.read_csv(csv_io)
+    return df
+
+def get_noaa_natural_monthly_flows_url(url = "https://www.nwrfc.noaa.gov/natural/nat_norm_text.cgi?id=TDAO3"):
+    """Function to get the noaa monthly natural inflows"""
+    natural = get_data_embedded_in_html(url)
+    natural = natural.melt(id_vars='Calendar Year', 
+                        value_vars=['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 
+                                    'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'])
+    natural = natural.rename(columns={'Calendar Year':'year', 
+                                    'variable':'month', 
+                                    'value':'vol_kaf'})
+    month_to_num = {'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4,
+                    'May': 5, 'Jun': 6, 'Jul': 7, 'Aug': 8, 
+                    'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dec': 12}
+    natural['Dalles_natural_inflow_cfs'] = kaf_to_cfs_vec(natural.vol_kaf,
+                    natural.month.replace(month_to_num), natural.year)
+    natural.month = natural.month.replace(month_to_num)
+    natural['day'] = 1
+    natural['dt'] = pd.to_datetime(natural[['year', 'month', 'day']])
+    natural = natural.sort_values('dt')
+    natural['dt'] = natural['dt'].dt.tz_localize('US/Pacific', ambiguous='NaT', nonexistent='shift_forward')
+    natural.set_index('dt', drop=True, inplace=True)
+    natural = natural.drop(columns=['year', 'month', 'day'])
+    natural = natural.dropna()
+    natural.drop(columns=['vol_kaf'], inplace=True)
+    return natural
+
+def get_noaa_natural_monthly_flows_csv(
+        path = r'\\fs109\PUBLIC\PowerManagement\IRP Working\ModelDataInput\bpa_inflows',
+        file = '\\Dalles_natural_monthly_1948_2023.csv'):
+    
+    df = pd.read_csv(path+file)
+    df.set_index('dt', inplace = True)
+    df.index = pd.to_datetime(df.index.str[:10]).tz_localize('US/Pacific')
+    columns = {'mean_natural_runoff_cfs':'Dalles_natural_inflow_cfs'}
+    df.rename(columns=columns, inplace=True)
+    return df
+
+def get_noaa_natural_monthly_flows(csv=True):
+    if csv:
+        return get_noaa_natural_monthly_flows_csv()
+    else:
+        return get_noaa_natural_monthly_flows_url()
+
+def make_dt_df(start, end, weather_offset_years=0, loop_end=None, loop_length_years=None):
+    '''make_dt_df is a helper function to create a datetime index
+    for a given range of time and dt.    
+    
+    Arguments
+    ---------
+    start: date str
+        start date for the model run in model time date string must be recognized by pandas
+    end: date str  
+        end date for the model run in model time date string must be recognized by pandas
+        end date is inclusive
+    weather_offset_years: Int
+        the number of years to offset the weather data from the datetime index of the system df 
+        
+    Returns
+    -------
+    DataFrame with a dt index and helper columns (utc time, timedelta, and date).  
+    '''
+    freq="H"
+    start_date = pd.Timestamp(start)
+    end_date = pd.Timestamp(end)
+    # columns for both Pacific and UTC
+    date_index_pt = pd.date_range(start=start_date, end=end_date, freq=freq, tz="US/Pacific")
+    date_index_utc = date_index_pt.tz_convert("UTC")
+    # dataframe
+    df = pd.DataFrame({'dt_utc': date_index_utc}, index=date_index_pt)
+    df.index.name = 'dt'
+    df['date'] = df.index.date
+    # add time_delta
+    time_delta_hr = list((df.index[1:] - df.index[:-1])/ pd.Timedelta(hours=1))
+    time_delta_hr.append(np.nan)
+    df['time_delta_hr'] = time_delta_hr
+    df['weather_offset_years'] = weather_offset_years
+    
+    # calc_weather_time returns the preliminary dt_weather
+    # and more_offset which is a boolean which True needs a loop
+    dt_weather, more_offset = calc_weather_time(df, loop_end)
+    df['dt_weather'] = dt_weather
+    
+    # if loop_end is specified then perform looping
+    if loop_end:
+        # calculate the number of additional times weather time should be calculated
+        delta_days = (end_date - start_date).days
+        delta_years = delta_days / 365.25
+        max_loops = np.ceil(delta_years/loop_length_years).astype(int)
+
+        # [TODO: this is slow because it recalculates at each loop. Could rewrite to calculate
+        # more_offset multipliers only once]
+        for _ in range(max_loops):
+            # add loop length to the weather offset to adjust weather offset years 
+            df['weather_offset_years'] += more_offset * loop_length_years
+            # recalculation weather_time and more offset
+            dt_weather, more_offset = calc_weather_time(df, loop_end)
+            df['dt_weather'] = dt_weather
+    return df
+
+def add_lagged_temp(df):  
+    # Add lagged temperature
+    lagged_temp = df.groupby('date')[['temp_daily_max_F','temp_daily_min_F']].mean()
+    lagged_temp.index = lagged_temp.index + pd.DateOffset(days=1)
+    lagged_temp.rename(columns=dict(zip(['temp_daily_max_F','temp_daily_min_F'], 
+                                        ['temp_max_lagged', 'temp_min_lagged'])), inplace=True)
+    # save the index to reinstate later
+    index = df.index.copy()
+    # if the lagged columns were already in there, drop
+    if 'temp_max_lagged' in df.columns:
+        df = df.drop(columns=['temp_max_lagged', 'temp_min_lagged'])
+    # merge lagged temp
+    df = df.merge(lagged_temp, left_on=pd.to_datetime(df.date).dt.date,
+            right_on=pd.to_datetime(lagged_temp.index).date, how='left')
+    # for the first day in the dt_df, temp_lagged = temp (yesterday=today)
+    df[['temp_max_lagged', 'temp_min_lagged']] = df[['temp_max_lagged', 'temp_min_lagged']].bfill()
+    # wrangle
+    df.drop(columns=['key_0'], inplace=True)
+    df.index = index
+    return df
